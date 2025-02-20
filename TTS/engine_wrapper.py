@@ -15,7 +15,7 @@ from utils.console import print_step, print_substep
 from utils.voice import sanitize_text
 
 DEFAULT_MAX_LENGTH: int = (
-    50  # Video length variable, edit this on your own risk. It should work, but it's not supported
+    70  # Video length variable, edit this on your own risk. It should work, but it's not supported
 )
 
 
@@ -92,12 +92,16 @@ class TTSEngine:
                     self.length -= self.last_clip_length
                     idx -= 1
                     break
+                
+                # Prepend comment number to the comment text
+                numbered_comment = f"{idx + 1} {comment['comment_body']}"
+                
                 if (
-                    len(comment["comment_body"]) > self.tts_module.max_chars
+                    len(numbered_comment) > self.tts_module.max_chars
                 ):  # Split the comment if it is too long
-                    self.split_post(comment["comment_body"], idx)  # Split the comment
+                    self.split_post(numbered_comment, idx)  # Split the comment
                 else:  # If the comment is not too long, just call the tts engine
-                    self.call_tts(f"{idx}", process_text(comment["comment_body"]))
+                    self.call_tts(f"{idx}", process_text(numbered_comment))
 
         print_substep("Saved Text to MP3 files successfully.", style="bold green")
         return self.length, idx

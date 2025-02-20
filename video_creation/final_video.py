@@ -85,29 +85,81 @@ def name_normalize(name: str) -> str:
 
 
 def prepare_background(reddit_id: str, W: int, H: int) -> str:
+    """Prepares the background video by cropping and encoding it appropriately.
+    
+    Args:
+        reddit_id (str): The Reddit post ID
+        W (int): Target width
+        H (int): Target height
+        
+    Returns:
+        str: Path to the prepared background video file
+    """
+    import ffmpeg
+    import platform
+    import multiprocessing
+    
     output_path = f"assets/temp/{reddit_id}/background_noaudio.mp4"
-    output = (
-        ffmpeg.input(f"assets/temp/{reddit_id}/background.mp4")
-        .filter("crop", f"ih*({W}/{H})", "ih")
-        .output(
-            output_path,
-            an=None,
-            **{
-                "c:v": "h264_nvenc",
+    
+    # Base video processing configuration
+    input_stream = ffmpeg.input(f"assets/temp/{reddit_id}/background.mp4")
+    video = input_stream.filter("crop", f"ih*({W}/{H})", "ih")
+    
+    # Determine system-appropriate encoder settings
+    system = platform.system().lower()
+    
+    if system == "darwin":  # macOS
+        # Use VideoToolbox hardware encoding if available
+        output_settings = {
+            "c:v": "h264_videotoolbox",  # macOS hardware encoder
+            "b:v": "20M",
+            "b:a": "192k",
+            "threads": multiprocessing.cpu_count(),
+        }
+    elif system == "windows":
+        # Try NVIDIA encoder first, fall back to CPU encoding if not available
+        try:
+            output = (
+                video.output(
+                    output_path,
+                    **{
+                        "c:v": "h264_nvenc",
+                        "b:v": "20M",
+                        "b:a": "192k",
+                        "threads": multiprocessing.cpu_count(),
+                    }
+                )
+                .overwrite_output()
+            )
+            output.run(quiet=True)
+            return output_path
+        except ffmpeg.Error:
+            output_settings = {
+                "c:v": "libx264",  # CPU-based encoder
                 "b:v": "20M",
                 "b:a": "192k",
                 "threads": multiprocessing.cpu_count(),
-            },
-        )
-        .overwrite_output()
-    )
+            }
+    else:  # Linux or other systems
+        # Use CPU encoding as a safe default
+        output_settings = {
+            "c:v": "libx264",
+            "b:v": "20M",
+            "b:a": "192k",
+            "threads": multiprocessing.cpu_count(),
+        }
+    
     try:
+        output = (
+            video.output(output_path, an=None, **output_settings)
+            .overwrite_output()
+        )
         output.run(quiet=True)
     except ffmpeg.Error as e:
-        print(e.stderr.decode("utf8"))
-        exit(1)
+        print(f"FFmpeg encoding error: {e.stderr.decode('utf8') if e.stderr else str(e)}")
+        raise
+        
     return output_path
-
 
 def get_text_height(draw, text, font, max_width):
     lines = textwrap.wrap(text, width=max_width)
@@ -120,7 +172,7 @@ def get_text_height(draw, text, font, max_width):
 
 def create_fancy_thumbnail(image, text, text_color, padding, wrap=35):
     """
-    It will take the 1px from the middle of the template and will be resized (stretched) vertically to accommodate the extra height needed for the title.
+    Create a dynamic thumbnail with resizable middle section and text overlay.
     """
     print_step(f"Creating fancy thumbnail for: {text}")
     font_title_size = 47
@@ -131,8 +183,6 @@ def create_fancy_thumbnail(image, text, text_color, padding, wrap=35):
     draw = ImageDraw.Draw(image)
     text_height = get_text_height(draw, text, font, wrap)
     lines = textwrap.wrap(text, width=wrap)
-    # This are -50 to reduce the empty space at the bottom of the image,
-    # change it as per your requirement if needed otherwise leave it.
     new_image_height = image_height + text_height + padding * (len(lines) - 1) - 50
 
     # Separate the image into top, middle (1px), and bottom parts
@@ -158,23 +208,37 @@ def create_fancy_thumbnail(image, text, text_color, padding, wrap=35):
 
     # Draw the title text on the new image
     draw = ImageDraw.Draw(new_image)
-    y = top_part_height + padding
+    y = top_part_height + padding * 2  # Increased initial padding
     for line in lines:
         draw.text((120, y), line, font=font, fill=text_color, align="left")
         y += get_text_height(draw, line, font, wrap) + padding
 
-    # Draw the username "PlotPulse" at the specific position
+    # Draw the username with verification icon
     username_font = ImageFont.truetype(os.path.join("fonts", "Roboto-Bold.ttf"), 30)
+    channel_name = settings.config["settings"]["channel_name"]
+    
+    # Load verification icon
+    verify_icon = Image.open(os.path.join("assets", "verify_icon.png"))
+    verify_icon = verify_icon.resize((30, 30))  # Adjust size as needed
+
+    # Calculate positioning
+    username_width = draw.textlength(channel_name, font=username_font)
+    total_width = username_width + verify_icon.width + 10  # 10px spacing
+    start_x = 205  # Kept original x-position
+
+    # Draw username
     draw.text(
-        (205, 825),
-        settings.config["settings"]["channel_name"],
+        (start_x, 825),
+        channel_name,
         font=username_font,
         fill=text_color,
-        align="left",
+        align="left"
     )
 
-    return new_image
+    # Paste verification icon
+    new_image.paste(verify_icon, (start_x + int(username_width) + 10, 825), verify_icon)
 
+    return new_image
 
 def merge_background_audio(audio: ffmpeg, reddit_id: str):
     """Gather an audio and merge with assets/backgrounds/background.mp3
@@ -202,19 +266,10 @@ def make_final_video(
     reddit_obj: dict,
     background_config: Dict[str, Tuple],
 ):
-    """Gathers audio clips, gathers all screenshots, stitches them together and saves the final video to assets/temp
-    Args:
-        number_of_clips (int): Index to end at when going through the screenshots'
-        length (int): Length of the video
-        reddit_obj (dict): The reddit object that contains the posts to read.
-        background_config (Tuple[str, str, str, Any]): The background config to use.
-    """
-    # settings values
+    """Creates final video with templated title and timed overlays"""
     W: Final[int] = int(settings.config["settings"]["resolution_w"])
     H: Final[int] = int(settings.config["settings"]["resolution_h"])
-
     opacity = settings.config["settings"]["opacity"]
-
     reddit_id = extract_id(reddit_obj)
 
     allowOnlyTTSFolder: bool = (
@@ -226,195 +281,126 @@ def make_final_video(
 
     background_clip = ffmpeg.input(prepare_background(reddit_id, W=W, H=H))
 
-    # Gather all audio clips
-    audio_clips = list()
-    if number_of_clips == 0 and settings.config["settings"]["storymode"] == "false":
-        print(
-            "No audio clips to gather. Please use a different TTS or post."
-        )  # This is to fix the TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'
-        exit()
-    if settings.config["settings"]["storymode"]:
-        if settings.config["settings"]["storymodemethod"] == 0:
-            audio_clips = [ffmpeg.input(f"assets/temp/{reddit_id}/mp3/title.mp3")]
-            audio_clips.insert(1, ffmpeg.input(f"assets/temp/{reddit_id}/mp3/postaudio.mp3"))
-        elif settings.config["settings"]["storymodemethod"] == 1:
-            audio_clips = [
-                ffmpeg.input(f"assets/temp/{reddit_id}/mp3/postaudio-{i}.mp3")
-                for i in track(range(number_of_clips + 1), "Collecting the audio files...")
-            ]
-            audio_clips.insert(0, ffmpeg.input(f"assets/temp/{reddit_id}/mp3/title.mp3"))
-
-    else:
-        audio_clips = [
-            ffmpeg.input(f"assets/temp/{reddit_id}/mp3/{i}.mp3") for i in range(number_of_clips)
-        ]
-        audio_clips.insert(0, ffmpeg.input(f"assets/temp/{reddit_id}/mp3/title.mp3"))
-
-        audio_clips_durations = [
-            float(ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/{i}.mp3")["format"]["duration"])
-            for i in range(number_of_clips)
-        ]
-        audio_clips_durations.insert(
-            0,
-            float(ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]),
-        )
-    audio_concat = ffmpeg.concat(*audio_clips, a=1, v=0)
-    ffmpeg.output(
-        audio_concat, f"assets/temp/{reddit_id}/audio.mp3", **{"b:a": "192k"}
-    ).overwrite_output().run(quiet=True)
-
-    console.log(f"[bold green] Video Will Be: {length} Seconds Long")
-
-    screenshot_width = int((W * 45) // 100)
-    audio = ffmpeg.input(f"assets/temp/{reddit_id}/audio.mp3")
-    final_audio = merge_background_audio(audio, reddit_id)
-
-    image_clips = list()
-
-    Path(f"assets/temp/{reddit_id}/png").mkdir(parents=True, exist_ok=True)
-
-    # Credits to tim (beingbored)
-    # get the title_template image and draw a text in the middle part of it with the title of the thread
+    # Create title using template
     title_template = Image.open("assets/title_template.png")
-
     title = reddit_obj["thread_title"]
-
     title = name_normalize(title)
-
     font_color = "#000000"
     padding = 5
 
-    # create_fancy_thumbnail(image, text, text_color, padding
     title_img = create_fancy_thumbnail(title_template, title, font_color, padding)
-
     title_img.save(f"assets/temp/{reddit_id}/png/title.png")
-    image_clips.insert(
-        0,
-        ffmpeg.input(f"assets/temp/{reddit_id}/png/title.png")["v"].filter(
-            "scale", screenshot_width, -1
-        ),
+
+    # Get title audio duration to use for timing
+    title_duration = float(
+        ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]
     )
 
-    current_time = 0
+    # Gather audio clips
+    if number_of_clips == 0 and settings.config["settings"]["storymode"] == "false":
+        print("No audio clips to gather. Please use a different TTS or post.")
+        exit()
+
+    # Add ding sound effect
+    ding_audio = ffmpeg.input("assets/ding.mp3")
+    
+    # Prepare title audio
+    title_audio = ffmpeg.input(f"assets/temp/{reddit_id}/mp3/title.mp3")
+
+    # Prepare other audio clips
+    audio_clips = []
     if settings.config["settings"]["storymode"]:
-        audio_clips_durations = [
-            float(
-                ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/postaudio-{i}.mp3")["format"]["duration"]
-            )
-            for i in range(number_of_clips)
-        ]
-        audio_clips_durations.insert(
-            0,
-            float(ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]),
-        )
         if settings.config["settings"]["storymodemethod"] == 0:
-            image_clips.insert(
-                1,
-                ffmpeg.input(f"assets/temp/{reddit_id}/png/story_content.png").filter(
-                    "scale", screenshot_width, -1
-                ),
-            )
-            background_clip = background_clip.overlay(
-                image_clips[0],
-                enable=f"between(t,{current_time},{current_time + audio_clips_durations[0]})",
-                x="(main_w-overlay_w)/2",
-                y="(main_h-overlay_h)/2",
-            )
-            current_time += audio_clips_durations[0]
+            audio_clips.append(ffmpeg.input(f"assets/temp/{reddit_id}/mp3/postaudio.mp3"))
         elif settings.config["settings"]["storymodemethod"] == 1:
-            for i in track(range(0, number_of_clips + 1), "Collecting the image files..."):
-                image_clips.append(
-                    ffmpeg.input(f"assets/temp/{reddit_id}/png/img{i}.png")["v"].filter(
-                        "scale", screenshot_width, -1
-                    )
-                )
-                background_clip = background_clip.overlay(
-                    image_clips[i],
-                    enable=f"between(t,{current_time},{current_time + audio_clips_durations[i]})",
-                    x="(main_w-overlay_w)/2",
-                    y="(main_h-overlay_h)/2",
-                )
-                current_time += audio_clips_durations[i]
+            audio_clips.extend([
+                ffmpeg.input(f"assets/temp/{reddit_id}/mp3/postaudio-{i}.mp3")
+                for i in track(range(number_of_clips + 1), "Collecting the audio files...")
+            ])
     else:
-        for i in range(0, number_of_clips + 1):
-            image_clips.append(
-                ffmpeg.input(f"assets/temp/{reddit_id}/png/comment_{i}.png")["v"].filter(
-                    "scale", screenshot_width, -1
-                )
-            )
-            image_overlay = image_clips[i].filter("colorchannelmixer", aa=opacity)
-            assert (
-                audio_clips_durations is not None
-            ), "Please make a GitHub issue if you see this. Ping @JasonLovesDoggo on GitHub."
-            background_clip = background_clip.overlay(
-                image_overlay,
-                enable=f"between(t,{current_time},{current_time + audio_clips_durations[i]})",
-                x="(main_w-overlay_w)/2",
-                y="(main_h-overlay_h)/2",
-            )
-            current_time += audio_clips_durations[i]
+        audio_clips.extend([
+            ffmpeg.input(f"assets/temp/{reddit_id}/mp3/{i}.mp3") 
+            for i in range(number_of_clips)
+        ])
 
-    title = extract_id(reddit_obj, "thread_title")
-    idx = extract_id(reddit_obj)
-    title_thumb = reddit_obj["thread_title"]
+    # Get title duration
+    title_duration = float(
+        ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]
+    )
 
-    filename = f"{name_normalize(title)[:251]}"
-    subreddit = settings.config["reddit"]["thread"]["subreddit"]
+    # Mix ding and title audio together
+    mixed_title = ffmpeg.filter(
+        [ding_audio, title_audio], 
+        'amix', 
+        inputs=2,
+        duration='longest'  # Use longest to ensure title audio finishes
+    )
+    
+    # # Add silence padding to ensure mixed_title reaches full title_duration
+    # mixed_title = ffmpeg.filter(
+    #     [mixed_title],
+    #     'apad',
+    #     pad_dur=title_duration
+    # )
 
-    if not exists(f"./results/{subreddit}"):
-        print_substep("The 'results' folder could not be found so it was automatically created.")
-        os.makedirs(f"./results/{subreddit}")
+    # Concatenate with remaining audio clips - they'll start after title finishes
+    all_audio = [mixed_title] + audio_clips
+    audio_concat = ffmpeg.concat(*all_audio, a=1, v=0)
+    final_audio = merge_background_audio(audio_concat, reddit_id)
 
-    if not exists(f"./results/{subreddit}/OnlyTTS") and allowOnlyTTSFolder:
-        print_substep("The 'OnlyTTS' folder could not be found so it was automatically created.")
-        os.makedirs(f"./results/{subreddit}/OnlyTTS")
+    console.log(f"[bold green] Video Will Be: {length} Seconds Long")
 
-    # create a thumbnail for the video
-    settingsbackground = settings.config["settings"]["background"]
+    # Handle title overlay with animations
+    screenshot_width = int((W * 45) // 100)
+    title_img = ffmpeg.input(f"assets/temp/{reddit_id}/png/title.png")["v"]
+    title_img = title_img.filter("scale", screenshot_width, -1)
+    title_img = title_img.filter("colorchannelmixer", aa=opacity)
 
-    if settingsbackground["background_thumbnail"]:
-        if not exists(f"./results/{subreddit}/thumbnails"):
-            print_substep(
-                "The 'results/thumbnails' folder could not be found so it was automatically created."
-            )
-            os.makedirs(f"./results/{subreddit}/thumbnails")
-        # get the first file with the .png extension from assets/backgrounds and use it as a background for the thumbnail
-        first_image = next(
-            (file for file in os.listdir("assets/backgrounds") if file.endswith(".png")),
-            None,
-        )
-        if first_image is None:
-            print_substep("No png files found in assets/backgrounds", "red")
+    # Animation timings
+    start_time = 0
+    zoom_in_duration = 0.75  # Time to zoom in
+    slide_out_duration = 0.75  # Time to slide out
+    end_time = title_duration
 
-        else:
-            font_family = settingsbackground["background_thumbnail_font_family"]
-            font_size = settingsbackground["background_thumbnail_font_size"]
-            font_color = settingsbackground["background_thumbnail_font_color"]
-            thumbnail = Image.open(f"assets/backgrounds/{first_image}")
-            width, height = thumbnail.size
-            thumbnailSave = create_thumbnail(
-                thumbnail,
-                font_family,
-                font_size,
-                font_color,
-                width,
-                height,
-                title_thumb,
-            )
-            thumbnailSave.save(f"./assets/temp/{reddit_id}/thumbnail.png")
-            print_substep(f"Thumbnail - Building Thumbnail in assets/temp/{reddit_id}/thumbnail.png")
+    # Add scale effect through transform filter 
+    animated_title = title_img.filter(
+        'scale',  # Basic size
+        screenshot_width,
+        -1
+    )
 
-    text = f"Background by {background_config['video'][2]}"
+    # Position and slide calculations
+    y_offset = -100  # Move up by 100 pixels
+    pos_x = f'if(gt(t,{end_time - slide_out_duration}), ' + \
+           f'(W-w)/2-(2*W)*(t-{end_time - slide_out_duration})/{slide_out_duration}, ' + \
+           f'(W-w)/2)'
+    pos_y = f'(H-h)/2-100'
+
+    transform_expr = f'transform=\'scale=if(lt(t,{zoom_in_duration}),0.5+t/{zoom_in_duration}/2,1)\''
+
+    # Apply transforms and overlay
+    background_clip = background_clip.overlay(
+        animated_title,
+        enable=f'between(t,{start_time},{end_time})',
+        x=pos_x,
+        y=pos_y,
+        eval='frame',
+        format='yuv420'
+    )
+
+    # Add background credit
     background_clip = ffmpeg.drawtext(
         background_clip,
-        text=text,
+        text=f"Background by {background_config['video'][2]}",
         x=f"(w-text_w)",
         y=f"(h-text_h)",
         fontsize=5,
         fontcolor="White",
         fontfile=os.path.join("fonts", "Roboto-Regular.ttf"),
     )
+    
     background_clip = background_clip.filter("scale", W, H)
+
     print_step("Rendering the video 🎥")
     from tqdm import tqdm
 
@@ -425,12 +411,26 @@ def make_final_video(
         old_percentage = pbar.n
         pbar.update(status - old_percentage)
 
+    title = extract_id(reddit_obj, "thread_title")
+    idx = extract_id(reddit_obj)
+    title_thumb = reddit_obj["thread_title"]
+    filename = f"{name_normalize(title)[:251]}"
+    subreddit = settings.config["reddit"]["thread"]["subreddit"]
+
+    # Create required directories
+    if not exists(f"./results/{subreddit}"):
+        print_substep("The 'results' folder could not be found so it was automatically created.")
+        os.makedirs(f"./results/{subreddit}")
+
+    if not exists(f"./results/{subreddit}/OnlyTTS") and allowOnlyTTSFolder:
+        print_substep("The 'OnlyTTS' folder could not be found so it was automatically created.")
+        os.makedirs(f"./results/{subreddit}/OnlyTTS")
+
+    # Render main video
     defaultPath = f"results/{subreddit}"
     with ProgressFfmpeg(length, on_update_example) as progress:
         path = defaultPath + f"/{filename}"
-        path = (
-            path[:251] + ".mp4"
-        )  # Prevent a error by limiting the path length, do not change this.
+        path = path[:251] + ".mp4"
         try:
             ffmpeg.output(
                 background_clip,
@@ -438,7 +438,7 @@ def make_final_video(
                 path,
                 f="mp4",
                 **{
-                    "c:v": "h264_nvenc",
+                    "c:v": "h264_videotoolbox",
                     "b:v": "20M",
                     "b:a": "192k",
                     "threads": multiprocessing.cpu_count(),
@@ -452,23 +452,24 @@ def make_final_video(
         except ffmpeg.Error as e:
             print(e.stderr.decode("utf8"))
             exit(1)
+
     old_percentage = pbar.n
     pbar.update(100 - old_percentage)
+
+    # Handle OnlyTTS version if enabled
     if allowOnlyTTSFolder:
         path = defaultPath + f"/OnlyTTS/{filename}"
-        path = (
-            path[:251] + ".mp4"
-        )  # Prevent a error by limiting the path length, do not change this.
+        path = path[:251] + ".mp4"
         print_step("Rendering the Only TTS Video 🎥")
         with ProgressFfmpeg(length, on_update_example) as progress:
             try:
                 ffmpeg.output(
                     background_clip,
-                    audio,
+                    audio_concat,  # Use concat audio without background music
                     path,
                     f="mp4",
                     **{
-                        "c:v": "h264_nvenc",
+                        "c:v": "h264_videotoolbox",
                         "b:v": "20M",
                         "b:a": "192k",
                         "threads": multiprocessing.cpu_count(),
@@ -485,9 +486,12 @@ def make_final_video(
 
         old_percentage = pbar.n
         pbar.update(100 - old_percentage)
+
     pbar.close()
+
     save_data(subreddit, filename + ".mp4", title, idx, background_config["video"][2])
     print_step("Removing temporary files 🗑")
     cleanups = cleanup(reddit_id)
     print_substep(f"Removed {cleanups} temporary files 🗑")
     print_step("Done! 🎉 The video is in the results folder 📁")
+
