@@ -1,8 +1,11 @@
-# Reddit Video Maker Bot 🎥
+# Reddit Video Maker Bot 🎥 (Strey Edition)
 
 All done WITHOUT video editing or asset compiling. Just pure ✨programming magic✨.
 
 Created by Lewis Menelaws & [TMRRW](https://tmrrwinc.ca)
+Modified by [Ethan Pae](https://github.com/streylix)
+
+this version attempts to generate content with a more modern format, removing the screenshotted comments and adding in comments.
 
 <a target="_blank" href="https://tmrrwinc.ca">
 <picture>
